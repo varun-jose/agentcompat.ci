@@ -8,6 +8,7 @@ baseline:
 
 candidates:
   - gemini
+  - kiro
 
 rules:
   tests_must_pass: true
@@ -20,10 +21,27 @@ rules:
   required_paths:
     - "src/orders/**"
 
-  max_changed_files: 8
+  changed_files:
+    max: 8
+    include_ignored: false
+    exclude:
+      - ".pytest_cache/**"
+      - "**/__pycache__/**"
+      - "**/*.pyc"
+      - "**/*.egg-info/**"
 
   forbidden_dependencies:
     - requests
+
+  dependency_drift:
+    removals_forbidden: true
+    versions_must_not_change: true
+    sources_must_not_change: true
+    lockfiles_must_not_change: false
+    lockfiles_must_be_updated_for_dependency_changes: false
+    lockfiles: []
+
+  dependency_manifests: []
 
 tasks:
   - fixtures/tasks/add-pagination.yaml

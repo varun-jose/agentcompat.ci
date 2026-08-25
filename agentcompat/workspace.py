@@ -1,6 +1,6 @@
 """Disposable Git workspaces for isolated agent execution."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import TracebackType
@@ -38,6 +38,7 @@ class WorkspaceDiff:
     changed_files: list[str]
     added_files: list[str]
     deleted_files: list[str]
+    ignored_files: list[str] = field(default_factory=list)
 
 
 class DisposableWorkspace:
@@ -73,13 +74,23 @@ class DisposableWorkspace:
         return self._repository
 
     def get_diff(self) -> WorkspaceDiff:
-        """Return deterministic tracked and untracked changes in the workspace."""
+        """Return changes relative to the workspace's immutable starting commit."""
         repository = self._active_repository()
         changed_files: set[str] = set()
         added_files: set[str] = set(repository.untracked_files)
         deleted_files: set[str] = set()
 
-        for item in repository.head.commit.diff(None):
+        ignored_output = repository.git.ls_files(
+            "--others",
+            "--ignored",
+            "--exclude-standard",
+            "-z",
+        )
+        ignored_files = {path for path in ignored_output.split("\0") if path}
+        added_files.difference_update(ignored_files)
+
+        original_commit = repository.commit(self.original_commit_sha)
+        for item in original_commit.diff(None):
             if item.renamed_file:
                 if item.a_path is not None:
                     deleted_files.add(item.a_path)
@@ -103,6 +114,7 @@ class DisposableWorkspace:
             changed_files=sorted(changed_files),
             added_files=sorted(added_files),
             deleted_files=sorted(deleted_files),
+            ignored_files=sorted(ignored_files),
         )
 
     @property
@@ -119,6 +131,11 @@ class DisposableWorkspace:
     def deleted_files(self) -> list[str]:
         """Return deleted tracked paths."""
         return self.get_diff().deleted_files
+
+    @property
+    def ignored_files(self) -> list[str]:
+        """Return untracked paths hidden by Git ignore rules."""
+        return self.get_diff().ignored_files
 
     def cleanup(self) -> None:
         """Close Git resources and remove the temporary workspace."""

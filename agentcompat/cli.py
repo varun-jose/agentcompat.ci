@@ -6,12 +6,21 @@ from pathlib import Path
 from typing import Annotated
 
 import typer
+from rich import box
+from rich.align import Align
 from rich.console import Console
+from rich.markup import escape
+from rich.panel import Panel
 from rich.progress import Progress, SpinnerColumn, TextColumn, TimeElapsedColumn
 from rich.table import Table
 
 from agentcompat import __version__
-from agentcompat.adapters import AgentAdapter, CodexAdapter, GeminiAdapter
+from agentcompat.adapters import (
+    AgentAdapter,
+    CodexAdapter,
+    GeminiAdapter,
+    KiroAdapter,
+)
 from agentcompat.contracts import ContractValidationError, load_contract
 from agentcompat.models import (
     AgentContract,
@@ -76,14 +85,53 @@ def _show_contract_summary(contract_path: Path, contract: AgentContract) -> None
     table.add_row("Required paths", _format_items(contract.rules.required_paths))
     table.add_row(
         "Max changed files",
-        str(contract.rules.max_changed_files)
-        if contract.rules.max_changed_files is not None
+        str(contract.rules.changed_files.max)
+        if contract.rules.changed_files.max is not None
         else "Not set",
+    )
+    table.add_row(
+        "Count Git-ignored files",
+        "Yes" if contract.rules.changed_files.include_ignored else "No",
+    )
+    table.add_row(
+        "Changed-file exclusions",
+        _format_items(contract.rules.changed_files.exclude),
     )
     table.add_row(
         "Forbidden dependencies",
         _format_items(contract.rules.forbidden_dependencies),
     )
+    table.add_row(
+        "Dependency manifests",
+        _format_items(
+            [
+                f"{manifest.path} ({manifest.role})"
+                for manifest in contract.rules.dependency_manifests
+            ]
+        ),
+    )
+    drift = contract.rules.dependency_drift
+    table.add_row(
+        "Dependency removals forbidden",
+        "Yes" if drift.removals_forbidden else "No",
+    )
+    table.add_row(
+        "Dependency versions fixed",
+        "Yes" if drift.versions_must_not_change else "No",
+    )
+    table.add_row(
+        "Dependency sources fixed",
+        "Yes" if drift.sources_must_not_change else "No",
+    )
+    table.add_row(
+        "Lockfiles fixed",
+        "Yes" if drift.lockfiles_must_not_change else "No",
+    )
+    table.add_row(
+        "Lockfiles co-updated",
+        "Yes" if drift.lockfiles_must_be_updated_for_dependency_changes else "No",
+    )
+    table.add_row("Lockfiles", _format_items(drift.lockfiles))
 
     console.print("[bold green]Contract is valid[/bold green]")
     console.print(table)
@@ -95,6 +143,8 @@ def _create_adapter(agent_name: str) -> AgentAdapter:
         return CodexAdapter()
     if agent_name == "gemini":
         return GeminiAdapter()
+    if agent_name == "kiro":
+        return KiroAdapter()
     raise RunnerConfigurationError(f"unsupported agent: {agent_name}")
 
 
@@ -119,11 +169,12 @@ def _evaluation_status(finding: EvaluationResult | None) -> str:
 
 
 def _changed_files(run: AgentRunResult) -> str:
-    """Format modified, added, and deleted paths for one run."""
+    """Format ordinary Git changes and visible Git-ignored artifacts."""
     changes = [
         *(f"modified: {path}" for path in run.diff.changed_files),
         *(f"added: {path}" for path in run.diff.added_files),
         *(f"deleted: {path}" for path in run.diff.deleted_files),
+        *(f"ignored: {path}" for path in run.diff.ignored_files),
     ]
     return "\n".join(changes) if changes else "None"
 
@@ -184,56 +235,191 @@ def _required_path_status(finding: EvaluationResult | None) -> str:
     return "FAIL"
 
 
+def _styled_status(status: str) -> str:
+    """Add a consistent icon and colour to a terminal status value."""
+    escaped_status = escape(status)
+    if status.startswith("PASS"):
+        return f"[bold green]✓ {escaped_status}[/bold green]"
+    if status.startswith(("FAIL", "ERROR")):
+        return f"[bold red]✗ {escaped_status}[/bold red]"
+    if status == "NOT REQUIRED":
+        return f"[dim]— {escaped_status}[/dim]"
+    return f"[bold yellow]? {escaped_status}[/bold yellow]"
+
+
+def _evaluation_details(finding: EvaluationResult | None) -> str:
+    """Return a concise human-readable explanation for one check."""
+    if finding is None:
+        return "No evaluator result was produced."
+    return finding.summary
+
+
 def _show_compatibility_report(result: CompatibilityResult) -> None:
-    """Render a complete Rich terminal compatibility report."""
+    """Render a spacious, sectioned Rich terminal compatibility report."""
     forbidden = _find_evaluation(result, "forbidden_paths")
     required = _find_evaluation(result, "required_paths")
+    build = _find_evaluation(result, "build_must_pass")
+    tests = _find_evaluation(result, "tests_must_pass")
+    max_changed = _find_evaluation(result, "max_changed_files")
+    forbidden_dependencies = _find_evaluation(result, "forbidden_dependencies")
+    dependency_removals = _find_evaluation(result, "dependency_removals")
+    dependency_versions = _find_evaluation(result, "dependency_version_changes")
+    dependency_sources = _find_evaluation(result, "dependency_source_changes")
+    lockfile_changes = _find_evaluation(result, "dependency_lockfile_changes")
+    lockfile_updates = _find_evaluation(result, "dependency_lockfile_updates")
     critical = _critical_failures(result)
     final_status = "PASS" if result.passed else "FAIL"
-    final_markup = (
-        "[bold green]PASS[/bold green]"
-        if result.passed
-        else "[bold red]FAIL[/bold red]"
-    )
+    compatibility = _compatibility_percentage(result)
+    border_style = "green" if result.passed else "red"
 
-    table = Table(title="AgentCompat CI compatibility report", show_header=False)
-    table.add_column("Field", style="bold cyan", no_wrap=True)
-    table.add_column("Result")
-    table.add_row("Baseline", result.baseline.agent_name)
-    table.add_row("Candidate", result.candidate.agent_name)
-    table.add_row("Task", _task_label(result))
-    table.add_row("Baseline execution", _execution_status(result.baseline))
-    table.add_row("Candidate execution", _execution_status(result.candidate))
-    table.add_row(
-        "Build status",
-        _evaluation_status(_find_evaluation(result, "build_must_pass")),
+    heading = (
+        f"[bold white]{escape(result.contract.project.name)}[/bold white]"
+        f"  [dim]•[/dim]  [cyan]{escape(_task_label(result))}[/cyan]"
     )
-    table.add_row(
-        "Test status",
-        _evaluation_status(_find_evaluation(result, "tests_must_pass")),
-    )
-    table.add_row("Baseline changed files", _changed_files(result.baseline))
-    table.add_row("Candidate changed files", _changed_files(result.candidate))
-    table.add_row(
-        "Forbidden path violations",
-        _format_items(forbidden.evidence) if forbidden is not None else "UNKNOWN",
-    )
-    table.add_row("Required path compliance", _required_path_status(required))
-    table.add_row(
-        "Compatibility percentage",
-        f"{_compatibility_percentage(result):.1f}%",
-    )
-    table.add_row(
-        "Critical failures",
-        "\n".join(
-            f"{finding.name}: {finding.summary}" for finding in critical
+    console.print()
+    console.print(
+        Panel(
+            Align.center(heading),
+            title="[bold cyan]AgentCompat CI compatibility report[/bold cyan]",
+            subtitle=f"commit {result.original_commit_sha[:8]}",
+            box=box.DOUBLE,
+            border_style="cyan",
+            padding=(1, 2),
         )
-        if critical
-        else "None",
     )
-    table.add_row("Final", final_markup)
-    console.print(table)
-    console.print(f"Final result: {final_markup} ({final_status})")
+    console.print()
+
+    runs = Table(
+        title="[bold]Agent runs[/bold]",
+        title_justify="left",
+        box=box.ROUNDED,
+        expand=True,
+        show_lines=True,
+        padding=(0, 1),
+        header_style="bold cyan",
+    )
+    runs.add_column("Role", no_wrap=True, width=19)
+    runs.add_column("Result", ratio=1)
+    runs.add_row(
+        "Baseline execution",
+        f"[bold]{escape(result.baseline.agent_name)}[/bold]  "
+        f"{_styled_status(_execution_status(result.baseline))}\n\n"
+        "[dim]Baseline changed files[/dim]\n"
+        f"{escape(_changed_files(result.baseline))}",
+    )
+    runs.add_row(
+        "Candidate execution",
+        f"[bold]{escape(result.candidate.agent_name)}[/bold]  "
+        f"{_styled_status(_execution_status(result.candidate))}\n\n"
+        "[dim]Candidate changed files[/dim]\n"
+        f"{escape(_changed_files(result.candidate))}",
+    )
+    console.print(runs)
+    console.print()
+
+    checks = Table(
+        title="[bold]Deterministic compatibility checks[/bold]",
+        title_justify="left",
+        box=box.ROUNDED,
+        expand=True,
+        padding=(0, 1),
+        header_style="bold cyan",
+    )
+    checks.add_column("Check", no_wrap=True, width=25)
+    checks.add_column("Status", no_wrap=True, width=12)
+    checks.add_column("Details", ratio=1)
+    checks.add_row(
+        "Build status",
+        _styled_status(_evaluation_status(build)),
+        escape(_evaluation_details(build)),
+    )
+    checks.add_row(
+        "Test status",
+        _styled_status(_evaluation_status(tests)),
+        escape(_evaluation_details(tests)),
+    )
+    checks.add_row(
+        "Forbidden path violations",
+        _styled_status(_evaluation_status(forbidden)),
+        (
+            escape(_format_items(forbidden.evidence))
+            if forbidden is not None and forbidden.evidence
+            else escape(_evaluation_details(forbidden))
+        ),
+    )
+    checks.add_row(
+        "Required path compliance",
+        _styled_status(_evaluation_status(required)),
+        escape(
+            _evaluation_details(required)
+            if required is not None and required.passed
+            else _required_path_status(required)
+        ),
+    )
+    checks.add_row(
+        "Changed-file limit",
+        _styled_status(_evaluation_status(max_changed)),
+        escape(_evaluation_details(max_changed)),
+    )
+    checks.add_row(
+        "Forbidden dependencies",
+        _styled_status(_evaluation_status(forbidden_dependencies)),
+        escape(_evaluation_details(forbidden_dependencies)),
+    )
+    for label, finding in (
+        ("Dependency removals", dependency_removals),
+        ("Dependency versions", dependency_versions),
+        ("Dependency sources", dependency_sources),
+        ("Lockfile changes", lockfile_changes),
+        ("Required lock updates", lockfile_updates),
+    ):
+        checks.add_row(
+            label,
+            _styled_status(_evaluation_status(finding)),
+            escape(
+                (f"{_evaluation_details(finding)} {_format_items(finding.evidence)}")
+                if finding is not None and finding.evidence
+                else _evaluation_details(finding)
+            ),
+        )
+    console.print(checks)
+    console.print()
+
+    critical_details = (
+        "\n".join(f"• {finding.name}: {finding.summary}" for finding in critical)
+        if critical
+        else "None"
+    )
+    final_markup = (
+        f"[bold green]✓ Final result: {final_status}[/bold green]"
+        if result.passed
+        else f"[bold red]✗ Final result: {final_status}[/bold red]"
+    )
+    verdict = Table.grid(expand=True, padding=(0, 1))
+    verdict.add_column(no_wrap=True, ratio=2)
+    verdict.add_column(ratio=4)
+    verdict.add_row(
+        final_markup,
+        "",
+    )
+    verdict.add_row(
+        "[bold]Compatibility percentage[/bold]",
+        Align.right(f"[bold]{compatibility:.1f}% compatible[/bold]"),
+    )
+    verdict.add_row(
+        "[bold]Critical failures[/bold]",
+        escape(critical_details),
+    )
+    console.print(
+        Panel(
+            verdict,
+            title="[bold]Final verdict[/bold]",
+            box=box.HEAVY,
+            border_style=border_style,
+            padding=(1, 2),
+        )
+    )
+    console.print()
 
 
 def _json_payload(result: CompatibilityResult) -> dict[str, object]:

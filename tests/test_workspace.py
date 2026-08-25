@@ -19,9 +19,13 @@ def source_repository(tmp_path: Path) -> Path:
     repository_path.mkdir()
     (repository_path / "modified.txt").write_text("original\n", encoding="utf-8")
     (repository_path / "deleted.txt").write_text("keep me\n", encoding="utf-8")
+    (repository_path / ".gitignore").write_text(
+        "ignored-output/\n",
+        encoding="utf-8",
+    )
 
     repository = Repo.init(repository_path)
-    repository.index.add(["modified.txt", "deleted.txt"])
+    repository.index.add([".gitignore", "modified.txt", "deleted.txt"])
     author = Actor("AgentCompat Tests", "tests@agentcompat.local")
     repository.index.commit("Initial commit", author=author, committer=author)
     repository.close()
@@ -112,6 +116,118 @@ def test_workspace_reports_modified_added_and_deleted_files(
         assert workspace.changed_files == ["modified.txt"]
         assert workspace.added_files == ["added.txt", "staged-added.txt"]
         assert workspace.deleted_files == ["deleted.txt"]
+        assert workspace.ignored_files == []
+
+
+def test_workspace_reports_changes_committed_by_agent(
+    source_repository: Path,
+) -> None:
+    manager = WorkspaceManager(source_repository)
+
+    with manager.create_workspace() as workspace:
+        (workspace.workspace_path / "modified.txt").write_text(
+            "committed change\n",
+            encoding="utf-8",
+        )
+        (workspace.workspace_path / "committed-added.txt").write_text(
+            "committed file\n",
+            encoding="utf-8",
+        )
+        (workspace.workspace_path / "deleted.txt").unlink()
+
+        repository = Repo(workspace.workspace_path)
+        repository.git.add("--all")
+        author = Actor("AgentCompat Tests", "tests@agentcompat.local")
+        repository.index.commit(
+            "Agent-created commit",
+            author=author,
+            committer=author,
+        )
+        assert repository.head.commit.hexsha != workspace.original_commit_sha
+        repository.close()
+
+        assert workspace.get_diff() == WorkspaceDiff(
+            changed_files=["modified.txt"],
+            added_files=["committed-added.txt"],
+            deleted_files=["deleted.txt"],
+        )
+
+
+def test_workspace_reports_files_ignored_by_repository_rules(
+    source_repository: Path,
+) -> None:
+    manager = WorkspaceManager(source_repository)
+
+    with manager.create_workspace() as workspace:
+        ignored_directory = workspace.workspace_path / "ignored-output"
+        ignored_directory.mkdir()
+        (ignored_directory / "generated.txt").write_text(
+            "ignored content\n",
+            encoding="utf-8",
+        )
+
+        repository = Repo(workspace.workspace_path)
+        assert repository.untracked_files == []
+        repository.close()
+
+        assert workspace.get_diff() == WorkspaceDiff(
+            changed_files=[],
+            added_files=[],
+            deleted_files=[],
+            ignored_files=["ignored-output/generated.txt"],
+        )
+        assert workspace.ignored_files == ["ignored-output/generated.txt"]
+
+
+def test_workspace_reports_files_hidden_by_local_exclude(
+    source_repository: Path,
+) -> None:
+    manager = WorkspaceManager(source_repository)
+
+    with manager.create_workspace() as workspace:
+        repository = Repo(workspace.workspace_path)
+        exclude_path = Path(repository.git_dir) / "info" / "exclude"
+        exclude_path.write_text("local-output/\n", encoding="utf-8")
+        local_directory = workspace.workspace_path / "local-output"
+        local_directory.mkdir()
+        (local_directory / "hidden.txt").write_text(
+            "locally ignored content\n",
+            encoding="utf-8",
+        )
+        assert repository.untracked_files == []
+        repository.close()
+
+        assert workspace.get_diff() == WorkspaceDiff(
+            changed_files=[],
+            added_files=[],
+            deleted_files=[],
+            ignored_files=["local-output/hidden.txt"],
+        )
+
+
+def test_workspace_reports_force_added_ignored_file_as_added(
+    source_repository: Path,
+) -> None:
+    manager = WorkspaceManager(source_repository)
+
+    with manager.create_workspace() as workspace:
+        ignored_directory = workspace.workspace_path / "ignored-output"
+        ignored_directory.mkdir()
+        (ignored_directory / "forced.txt").write_text(
+            "force-added content\n",
+            encoding="utf-8",
+        )
+
+        repository = Repo(workspace.workspace_path)
+        repository.git.add("--force", "ignored-output/forced.txt")
+        repository.close()
+
+        assert workspace.get_diff() == WorkspaceDiff(
+            changed_files=[],
+            added_files=["ignored-output/forced.txt"],
+            deleted_files=[],
+            ignored_files=[],
+        )
 
 
 def test_cleanup_is_idempotent_and_removes_workspace(
