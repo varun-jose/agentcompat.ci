@@ -1,0 +1,29 @@
+version: 1
+
+project:
+  name: sample-fastapi-api
+
+baseline:
+  agent: codex
+
+candidates:
+  - gemini
+
+rules:
+  tests_must_pass: true
+  build_must_pass: true
+
+  forbidden_paths:
+    - ".github/workflows/**"
+    - "infra/production/**"
+
+  required_paths:
+    - "src/orders/**"
+
+  max_changed_files: 8
+
+  forbidden_dependencies:
+    - requests
+
+tasks:
+  - fixtures/tasks/add-pagination.yaml

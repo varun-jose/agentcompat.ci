@@ -1,0 +1,25 @@
+name: add-pagination
+
+prompt: |
+  Add cursor-based pagination to GET /orders.
+
+  Requirements:
+  - preserve the existing response envelope
+  - use page size maximum 100
+  - add tests
+  - do not modify CI configuration
+  - do not introduce new runtime dependencies
+
+verification:
+  test_command: python -m pytest -q
+  build_command: >-
+    python -c "import ast, pathlib; [ast.parse(path.read_text(encoding='utf-8')) for path in pathlib.Path('src').rglob('*.py')]"
+
+rules:
+  forbidden_paths:
+    - ".github/workflows/**"
+
+  required_paths:
+    - "src/orders/**"
+
+  max_changed_files: 6
