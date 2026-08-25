@@ -73,6 +73,7 @@ async def test_concrete_adapter_prepares_and_executes(tmp_path: Path) -> None:
         "name": "add-pagination",
         "prompt": "Add pagination.",
         "verification": None,
+        "rules": None,
     }
     assert result.metadata["workspace"] == str(tmp_path)
 

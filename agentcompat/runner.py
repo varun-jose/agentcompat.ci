@@ -10,10 +10,24 @@ import yaml
 from pydantic import ValidationError
 
 from agentcompat.adapters.base import AgentAdapter
-from agentcompat.contracts import load_contract
+from agentcompat.contracts import load_contract, merge_task_rules
+from agentcompat.dependencies import (
+    DependencyScanError,
+    canonicalize_dependency_name,
+    scan_python_dependency_snapshot,
+)
+from agentcompat.dependency_types import (
+    DependencySnapshot,
+    compare_dependency_snapshots,
+)
 from agentcompat.evaluators import (
     BuildMustPassEvaluator,
     ChangedFileCountEvaluator,
+    DependencyLockfileChangeEvaluator,
+    DependencyLockfileUpdateEvaluator,
+    DependencyRemovalEvaluator,
+    DependencySourceChangeEvaluator,
+    DependencyVersionChangeEvaluator,
     ForbiddenDependencyEvaluator,
     ForbiddenPathEvaluator,
     RequiredPathEvaluator,
@@ -25,6 +39,7 @@ from agentcompat.models import (
     AgentExecutionResult,
     AgentRunResult,
     CompatibilityResult,
+    ContractRules,
     EvaluationResult,
     TaskDefinition,
     WorkspaceChanges,
@@ -32,6 +47,27 @@ from agentcompat.models import (
 from agentcompat.workspace import DisposableWorkspace, WorkspaceDiff, WorkspaceManager
 
 DEFAULT_VERIFICATION_TIMEOUT_SECONDS = 300.0
+_MAX_DEPENDENCY_REPORT_ITEMS = 200
+_MAX_DEPENDENCY_EVIDENCE_CHARS = 500
+_DEPENDENCY_METADATA_KEYS = {
+    "added_dependencies",
+    "changed_lockfiles",
+    "dependencies_after",
+    "dependencies_before",
+    "forbidden_dependency_additions",
+    "locked_dependencies_after",
+    "locked_dependencies_before",
+    "removed_dependencies",
+}
+_DEPENDENCY_METADATA_PREFIXES = (
+    "added_dependencies",
+    "changed_lockfiles",
+    "dependencies_",
+    "dependency_",
+    "forbidden_dependency_",
+    "locked_dependencies_",
+    "removed_dependencies",
+)
 type ProgressCallback = Callable[[str], None]
 
 
@@ -96,12 +132,34 @@ def load_task(path: Path) -> TaskDefinition:
         raise TaskValidationError(_format_task_validation_error(exc)) from exc
 
 
+def _validate_declared_task(
+    contract: AgentContract,
+    contract_path: Path,
+    task_path: Path,
+) -> None:
+    """Require the selected task path to be declared by the contract."""
+    contract_directory = contract_path.resolve().parent
+    declared_paths: set[Path] = set()
+    for task_entry in contract.tasks:
+        declared_path = Path(task_entry)
+        if not declared_path.is_absolute():
+            declared_path = contract_directory / declared_path
+        declared_paths.add(declared_path.resolve())
+
+    selected_path = task_path.resolve()
+    if selected_path not in declared_paths:
+        raise RunnerConfigurationError(
+            f"task is not declared by the contract: {selected_path}"
+        )
+
+
 def _workspace_changes(diff: WorkspaceDiff) -> WorkspaceChanges:
     """Convert the workspace-layer diff into the serializable report model."""
     return WorkspaceChanges(
         changed_files=diff.changed_files,
         added_files=diff.added_files,
         deleted_files=diff.deleted_files,
+        ignored_files=diff.ignored_files,
     )
 
 
@@ -281,7 +339,20 @@ async def _execute_agent(
         progress_callback,
         f"{role.capitalize()} agent {exit_status}",
     )
-    return result, None
+    return _without_adapter_dependency_metadata(result), None
+
+
+def _without_adapter_dependency_metadata(
+    execution: AgentExecutionResult,
+) -> AgentExecutionResult:
+    """Remove dependency observations that only the trusted runner may emit."""
+    metadata = {
+        key: value
+        for key, value in execution.metadata.items()
+        if not key.startswith(_DEPENDENCY_METADATA_PREFIXES)
+        and key not in _DEPENDENCY_METADATA_KEYS
+    }
+    return execution.model_copy(update={"metadata": metadata})
 
 
 def _agent_run_result(
@@ -342,22 +413,250 @@ def _boolean_metadata(
     return value if isinstance(value, bool) else None
 
 
-def _added_dependencies(execution: AgentExecutionResult | None) -> list[str]:
+def _added_dependencies(execution: AgentExecutionResult | None) -> list[str] | None:
     """Read normalized dependency observations from execution metadata."""
     if execution is None:
-        return []
-    value = execution.metadata.get("added_dependencies")
-    if not isinstance(value, list):
-        return []
-    return [dependency for dependency in value if isinstance(dependency, str)]
+        return None
+    value = execution.metadata.get(
+        "forbidden_dependency_additions",
+        execution.metadata.get("added_dependencies"),
+    )
+    if not isinstance(value, list) or not all(
+        isinstance(dependency, str) for dependency in value
+    ):
+        return None
+    return value
+
+
+def _dependency_changes(
+    execution: AgentExecutionResult | None,
+    key: str,
+) -> list[str] | None:
+    """Read one trusted dependency-delta evidence list."""
+    if execution is None:
+        return None
+    value = execution.metadata.get(key)
+    if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+        return None
+    return value
+
+
+def _dependency_change_count(
+    execution: AgentExecutionResult | None,
+    key: str,
+) -> int | None:
+    """Read the untruncated size of one trusted dependency delta."""
+    if execution is None:
+        return None
+    value = execution.metadata.get(f"{key}_count")
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def _bounded_dependency_evidence(value: str) -> str:
+    """Bound one report value while preserving a clear truncation marker."""
+    if len(value) <= _MAX_DEPENDENCY_EVIDENCE_CHARS:
+        return value
+    return f"{value[: _MAX_DEPENDENCY_EVIDENCE_CHARS - 1]}…"
+
+
+def _bounded_items(values: list[str] | tuple[str, ...]) -> list[str]:
+    """Bound a deterministic sequence before placing it in report metadata."""
+    return [
+        _bounded_dependency_evidence(value)
+        for value in values[:_MAX_DEPENDENCY_REPORT_ITEMS]
+    ]
+
+
+def _dependency_scan_error(execution: AgentExecutionResult | None) -> str | None:
+    """Read a runner-generated dependency scan error from execution metadata."""
+    if execution is None:
+        return None
+    value = execution.metadata.get("dependency_scan_error")
+    return value if isinstance(value, str) else None
+
+
+def _with_dependency_observation(
+    execution: AgentExecutionResult | None,
+    original_snapshot: DependencySnapshot,
+    workspace: Path,
+    rules: ContractRules,
+) -> AgentExecutionResult | None:
+    """Attach a runner-generated dependency delta to an execution result."""
+    if execution is None:
+        return None
+
+    metadata = dict(_without_adapter_dependency_metadata(execution).metadata)
+    direct_before = sorted(original_snapshot.direct_names)
+    locked_before = sorted(original_snapshot.locked_names)
+    metadata.update(
+        {
+            "dependency_observation_schema": 2,
+            "dependency_scanner": "python-manifests-lockfiles-v2",
+            "dependencies_before": _bounded_items(direct_before),
+            "dependencies_before_count": len(direct_before),
+            "dependencies_before_truncated": (
+                len(direct_before) > _MAX_DEPENDENCY_REPORT_ITEMS
+            ),
+            "locked_dependencies_before": _bounded_items(locked_before),
+            "locked_dependencies_before_count": len(locked_before),
+            "locked_dependencies_before_truncated": (
+                len(locked_before) > _MAX_DEPENDENCY_REPORT_ITEMS
+            ),
+        }
+    )
+    try:
+        final_snapshot = _scan_dependency_snapshot(workspace, rules)
+    except DependencyScanError as exc:
+        metadata.update(
+            {
+                "dependency_observation_available": False,
+                "dependency_scan_error": _bounded_dependency_evidence(str(exc)),
+            }
+        )
+    else:
+        delta = compare_dependency_snapshots(original_snapshot, final_snapshot)
+        version_changes = _bounded_items(
+            [
+                change.evidence()
+                for change in delta.version_changes[:_MAX_DEPENDENCY_REPORT_ITEMS]
+            ]
+        )
+        source_changes = _bounded_items(
+            [
+                change.evidence()
+                for change in delta.source_changes[:_MAX_DEPENDENCY_REPORT_ITEMS]
+            ]
+        )
+        lockfile_changes = _bounded_items(
+            [change.evidence() for change in delta.lockfile_changes]
+        )
+        input_changes = _bounded_items(
+            [
+                change.evidence()
+                for change in delta.declaration_changes[:_MAX_DEPENDENCY_REPORT_ITEMS]
+            ]
+        )
+        dependency_input_changed = bool(delta.declaration_changes)
+        lockfile_change_types = {
+            change.path: change.change for change in delta.lockfile_changes
+        }
+        missing_lockfile_updates = (
+            [
+                path
+                for path in rules.dependency_drift.lockfiles
+                if lockfile_change_types.get(path) not in {"added", "modified"}
+            ]
+            if dependency_input_changed
+            else []
+        )
+        direct_after = sorted(final_snapshot.direct_names)
+        locked_after = sorted(final_snapshot.locked_names)
+        added = list(delta.added)
+        removed = list(delta.removed)
+        forbidden = {
+            canonicalize_dependency_name(name) for name in rules.forbidden_dependencies
+        }
+        forbidden_additions = [name for name in added if name in forbidden]
+        metadata.update(
+            {
+                "dependency_observation_available": True,
+                "dependencies_after": _bounded_items(direct_after),
+                "dependencies_after_count": len(direct_after),
+                "dependencies_after_truncated": len(direct_after)
+                > _MAX_DEPENDENCY_REPORT_ITEMS,
+                "locked_dependencies_after": _bounded_items(locked_after),
+                "locked_dependencies_after_count": len(locked_after),
+                "locked_dependencies_after_truncated": len(locked_after)
+                > _MAX_DEPENDENCY_REPORT_ITEMS,
+                "added_dependencies": _bounded_items(added),
+                "added_dependencies_count": len(added),
+                "added_dependencies_truncated": len(added)
+                > _MAX_DEPENDENCY_REPORT_ITEMS,
+                "forbidden_dependency_additions": _bounded_items(forbidden_additions),
+                "removed_dependencies": _bounded_items(removed),
+                "removed_dependencies_count": len(removed),
+                "removed_dependencies_truncated": len(removed)
+                > _MAX_DEPENDENCY_REPORT_ITEMS,
+                "dependency_version_changes": version_changes,
+                "dependency_version_changes_count": len(delta.version_changes),
+                "dependency_version_changes_truncated": len(delta.version_changes)
+                > _MAX_DEPENDENCY_REPORT_ITEMS,
+                "dependency_source_changes": source_changes,
+                "dependency_source_changes_count": len(delta.source_changes),
+                "dependency_source_changes_truncated": len(delta.source_changes)
+                > _MAX_DEPENDENCY_REPORT_ITEMS,
+                "dependency_lockfile_changes": lockfile_changes,
+                "dependency_lockfile_changes_count": len(delta.lockfile_changes),
+                "dependency_lockfile_changes_truncated": len(delta.lockfile_changes)
+                > _MAX_DEPENDENCY_REPORT_ITEMS,
+                "dependency_lockfile_update_failures": _bounded_items(
+                    missing_lockfile_updates
+                ),
+                "dependency_lockfile_update_failures_count": len(
+                    missing_lockfile_updates
+                ),
+                "dependency_lockfile_update_failures_truncated": len(
+                    missing_lockfile_updates
+                )
+                > _MAX_DEPENDENCY_REPORT_ITEMS,
+                "dependency_input_changes": input_changes,
+                "dependency_input_changes_count": len(delta.declaration_changes),
+                "dependency_input_changes_truncated": len(delta.declaration_changes)
+                > _MAX_DEPENDENCY_REPORT_ITEMS,
+                "dependency_input_changed": dependency_input_changed,
+                "dependency_record_count_before": len(original_snapshot.records),
+                "dependency_record_count_after": len(final_snapshot.records),
+            }
+        )
+    return execution.model_copy(update={"metadata": metadata})
+
+
+def _dependency_observation_required(rules: ContractRules) -> bool:
+    drift = rules.dependency_drift
+    return bool(
+        rules.forbidden_dependencies
+        or drift.removals_forbidden
+        or drift.versions_must_not_change
+        or drift.sources_must_not_change
+        or drift.lockfiles_must_not_change
+        or drift.lockfiles_must_be_updated_for_dependency_changes
+    )
+
+
+def _scan_dependency_snapshot(
+    workspace: Path,
+    rules: ContractRules,
+) -> DependencySnapshot:
+    drift = rules.dependency_drift
+    include_lockfiles = bool(
+        drift.versions_must_not_change
+        or drift.sources_must_not_change
+        or drift.lockfiles_must_not_change
+        or drift.lockfiles_must_be_updated_for_dependency_changes
+        or drift.lockfiles
+    )
+    return scan_python_dependency_snapshot(
+        workspace,
+        manifest_roles=[
+            (manifest.path, manifest.role) for manifest in rules.dependency_manifests
+        ],
+        lockfiles=drift.lockfiles,
+        include_lockfiles=include_lockfiles,
+        parse_lockfile_semantics=(
+            drift.versions_must_not_change or drift.sources_must_not_change
+        ),
+        require_lock_sources=drift.sources_must_not_change,
+    )
 
 
 def _evaluate_candidate(
-    contract: AgentContract,
+    rules: ContractRules,
     candidate: AgentRunResult,
+    *,
+    contract_max_changed_files: int | None = None,
+    task_max_changed_files: int | None = None,
 ) -> list[EvaluationResult]:
     """Apply all deterministic contract evaluators to the candidate run."""
-    rules = contract.rules
     return [
         TestsMustPassEvaluator(rules.tests_must_pass).evaluate(
             _boolean_metadata(candidate.execution, "tests_passed")
@@ -365,23 +664,69 @@ def _evaluate_candidate(
         BuildMustPassEvaluator(rules.build_must_pass).evaluate(
             _boolean_metadata(candidate.execution, "build_passed")
         ),
-        ForbiddenPathEvaluator(rules.forbidden_paths).evaluate(
-            candidate.diff.changed_files
-            + candidate.diff.added_files
-            + candidate.diff.deleted_files
-        ),
-        RequiredPathEvaluator(rules.required_paths).evaluate(
-            candidate.diff.changed_files
-            + candidate.diff.added_files
-            + candidate.diff.deleted_files
-        ),
-        ChangedFileCountEvaluator(rules.max_changed_files).evaluate(
-            candidate.diff.changed_files
-            + candidate.diff.added_files
-            + candidate.diff.deleted_files
-        ),
+        ForbiddenPathEvaluator(rules.forbidden_paths).evaluate(candidate.diff),
+        RequiredPathEvaluator(rules.required_paths).evaluate(candidate.diff),
+        ChangedFileCountEvaluator(
+            rules.changed_files.max,
+            include_ignored=rules.changed_files.include_ignored,
+            exclude=rules.changed_files.exclude,
+            contract_max_changed_files=contract_max_changed_files,
+            task_max_changed_files=task_max_changed_files,
+        ).evaluate(candidate.diff),
         ForbiddenDependencyEvaluator(rules.forbidden_dependencies).evaluate(
-            _added_dependencies(candidate.execution)
+            _added_dependencies(candidate.execution),
+            observation_error=_dependency_scan_error(candidate.execution),
+        ),
+        DependencyRemovalEvaluator(rules.dependency_drift.removals_forbidden).evaluate(
+            _dependency_changes(candidate.execution, "removed_dependencies"),
+            observation_error=_dependency_scan_error(candidate.execution),
+            total_count=_dependency_change_count(
+                candidate.execution,
+                "removed_dependencies",
+            ),
+        ),
+        DependencyVersionChangeEvaluator(
+            rules.dependency_drift.versions_must_not_change
+        ).evaluate(
+            _dependency_changes(candidate.execution, "dependency_version_changes"),
+            observation_error=_dependency_scan_error(candidate.execution),
+            total_count=_dependency_change_count(
+                candidate.execution,
+                "dependency_version_changes",
+            ),
+        ),
+        DependencySourceChangeEvaluator(
+            rules.dependency_drift.sources_must_not_change
+        ).evaluate(
+            _dependency_changes(candidate.execution, "dependency_source_changes"),
+            observation_error=_dependency_scan_error(candidate.execution),
+            total_count=_dependency_change_count(
+                candidate.execution,
+                "dependency_source_changes",
+            ),
+        ),
+        DependencyLockfileChangeEvaluator(
+            rules.dependency_drift.lockfiles_must_not_change
+        ).evaluate(
+            _dependency_changes(candidate.execution, "dependency_lockfile_changes"),
+            observation_error=_dependency_scan_error(candidate.execution),
+            total_count=_dependency_change_count(
+                candidate.execution,
+                "dependency_lockfile_changes",
+            ),
+        ),
+        DependencyLockfileUpdateEvaluator(
+            rules.dependency_drift.lockfiles_must_be_updated_for_dependency_changes
+        ).evaluate(
+            _dependency_changes(
+                candidate.execution,
+                "dependency_lockfile_update_failures",
+            ),
+            observation_error=_dependency_scan_error(candidate.execution),
+            total_count=_dependency_change_count(
+                candidate.execution,
+                "dependency_lockfile_update_failures",
+            ),
         ),
     ]
 
@@ -421,7 +766,9 @@ class CompatibilityRunner:
         """Execute one contract task for a baseline/candidate agent pair."""
         _notify_progress(progress_callback, "Loading contract and task")
         contract = load_contract(contract_path)
+        _validate_declared_task(contract, contract_path, task_path)
         task = load_task(task_path)
+        effective_rules = merge_task_rules(contract.rules, task.rules)
         selected_baseline = baseline_name or contract.baseline.agent
         if selected_baseline != contract.baseline.agent:
             raise RunnerConfigurationError(
@@ -447,6 +794,19 @@ class CompatibilityRunner:
             workspace_manager.create_workspace() as candidate_workspace,
         ):
             try:
+                original_snapshot: DependencySnapshot | None = None
+                if _dependency_observation_required(effective_rules):
+                    try:
+                        original_snapshot = _scan_dependency_snapshot(
+                            candidate_workspace.workspace_path,
+                            effective_rules,
+                        )
+                    except DependencyScanError as exc:
+                        raise RunnerConfigurationError(
+                            "could not scan source dependencies: "
+                            f"{_bounded_dependency_evidence(str(exc))}"
+                        ) from exc
+
                 baseline_execution, baseline_error = await _execute_agent(
                     baseline_adapter,
                     task,
@@ -465,6 +825,17 @@ class CompatibilityRunner:
                     selected_candidate,
                     progress_callback,
                 )
+                if original_snapshot is not None:
+                    _notify_progress(
+                        progress_callback,
+                        "Scanning candidate dependency changes",
+                    )
+                    candidate_execution = _with_dependency_observation(
+                        candidate_execution,
+                        original_snapshot,
+                        candidate_workspace.workspace_path,
+                        effective_rules,
+                    )
                 _notify_progress(progress_callback, "Collecting Git changes")
                 baseline = _agent_run_result(
                     agent_name=selected_baseline,
@@ -485,7 +856,19 @@ class CompatibilityRunner:
                 evaluations = [
                     _execution_evaluation("baseline", baseline),
                     _execution_evaluation("candidate", candidate),
-                    *_evaluate_candidate(contract, candidate),
+                    *_evaluate_candidate(
+                        effective_rules,
+                        candidate,
+                        contract_max_changed_files=(
+                            contract.rules.changed_files.max
+                        ),
+                        task_max_changed_files=(
+                            task.rules.changed_files.max
+                            if task.rules is not None
+                            and task.rules.changed_files is not None
+                            else None
+                        ),
+                    ),
                 ]
                 result = CompatibilityResult(
                     contract=contract,

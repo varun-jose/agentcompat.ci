@@ -10,6 +10,7 @@ from typer.testing import CliRunner
 
 import agentcompat.cli as cli_module
 from agentcompat import __version__
+from agentcompat.adapters import KiroAdapter
 from agentcompat.cli import app
 from agentcompat.evaluators import build_compatibility_verdict
 from agentcompat.models import (
@@ -60,6 +61,12 @@ def test_cli_reports_version() -> None:
     assert result.output == f"agentcompat {__version__}\n"
 
 
+def test_cli_supports_kiro_adapter() -> None:
+    adapter = cli_module._create_adapter("kiro")
+
+    assert isinstance(adapter, KiroAdapter)
+
+
 def test_validate_displays_contract_summary(tmp_path: Path) -> None:
     contract_path = tmp_path / "contract.yaml"
     contract_path.write_text(VALID_CONTRACT_YAML, encoding="utf-8")
@@ -72,6 +79,8 @@ def test_validate_displays_contract_summary(tmp_path: Path) -> None:
     assert "codex" in result.output
     assert "gemini" in result.output
     assert "Tests must pass" in result.output
+    assert "Count Git-ignored files" in result.output
+    assert "Changed-file exclusions" in result.output
 
 
 def test_validate_reports_schema_errors(tmp_path: Path) -> None:
@@ -172,16 +181,17 @@ def compatibility_result(
             exit_code=candidate_exit_code,
             stderr=candidate_stderr,
         ),
-        diff=WorkspaceChanges(changed_files=["src/app.py"]),
+        diff=WorkspaceChanges(
+            changed_files=["src/app.py"],
+            ignored_files=[".pytest_cache/README.md"],
+        ),
     )
     findings = [
         evaluation(
             "baseline_execution",
             passed=baseline_error is None,
             evidence=(
-                [baseline_error]
-                if baseline_error is not None
-                else ["exit_code=0"]
+                [baseline_error] if baseline_error is not None else ["exit_code=0"]
             ),
             summary=(
                 f"Baseline agent failed to execute: {baseline_error}"
@@ -292,6 +302,9 @@ def test_run_displays_passing_rich_report_and_writes_json(
 
     assert result.exit_code == 0
     assert "AgentCompat CI compatibility report" in result.output
+    assert "Agent runs" in result.output
+    assert "Deterministic compatibility checks" in result.output
+    assert "Final verdict" in result.output
     assert "Baseline" in result.output
     assert "codex" in result.output
     assert "Candidate" in result.output
@@ -303,12 +316,13 @@ def test_run_displays_passing_rich_report_and_writes_json(
     assert "Test status" in result.output
     assert "Candidate changed files" in result.output
     assert "src/app.py" in result.output
+    assert "ignored: .pytest_cache/README.md" in result.output
     assert "Forbidden path violations" in result.output
     assert "Required path compliance" in result.output
     assert "Compatibility percentage" in result.output
     assert "100.0%" in result.output
     assert "Critical failures" in result.output
-    assert "Final result: PASS" in result.output
+    assert "✓ Final result: PASS" in result.output
     assert captured["baseline_name"] == "codex"
     assert captured["candidate_name"] == "gemini"
     assert callable(captured["progress_callback"])
@@ -317,6 +331,10 @@ def test_run_displays_passing_rich_report_and_writes_json(
     assert payload["baseline"]["agent_name"] == "codex"
     assert payload["candidate"]["agent_name"] == "gemini"
     assert payload["candidate"]["diff"]["changed_files"] == ["src/app.py"]
+    assert payload["candidate"]["diff"]["added_files"] == []
+    assert payload["candidate"]["diff"]["ignored_files"] == [
+        ".pytest_cache/README.md"
+    ]
     assert payload["compatibility_percentage"] == 100.0
     assert payload["critical_failures"] == []
     assert payload["final_status"] == "PASS"
@@ -337,7 +355,7 @@ def test_run_returns_one_and_reports_critical_compatibility_failure(
     assert "secrets/token.txt" in result.output
     assert "83.3%" in result.output
     assert "forbidden_paths" in result.output
-    assert "Final result: FAIL" in result.output
+    assert "✗ Final result: FAIL" in result.output
 
 
 def test_run_returns_two_for_agent_execution_error(

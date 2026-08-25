@@ -48,7 +48,8 @@ AgentCompat CI makes those differences measurable.
 
 ![How AgentCompat CI Works](docs/assets/agentcompat-ci-workflow.png)
 
-AgentCompat executes the same engineering task against a baseline agent and one or more candidate agents using isolated repository workspaces.
+AgentCompat executes the same engineering task against one baseline agent and one
+candidate agent per invocation using isolated repository workspaces.
 
 It then evaluates the resulting behaviour using deterministic checks.
 
@@ -104,51 +105,40 @@ The project focuses on behavioural compatibility rather than subjective code pre
 
 ## Example
 
-Suppose the same task is executed by Codex and Gemini.
+Suppose the same task is executed by Codex and Kiro.
+
+This short example assumes a maintainer checkout containing the local orders API
+fixture. Fresh-clone and custom-repository requirements are documented in the full
+runbook linked below.
 
 ```bash
+source .venv/bin/activate
+
+PYTHONDONTWRITEBYTECODE=1 \
+PYTEST_ADDOPTS="-p no:cacheprovider" \
 agentcompat run \
   --repo fixtures/repos/orders-api \
   --baseline codex \
-  --candidate gemini \
+  --candidate kiro \
   --contract agent-contract.yaml \
-  --task fixtures/tasks/add-pagination.yaml
+  --task fixtures/tasks/add-pagination.yaml \
+  --json-output results-codex-vs-kiro-run-01.json
 ```
 
-AgentCompat may produce:
+See [Run a Codex-versus-Kiro Compatibility Test](#run-a-codex-versus-kiro-compatibility-test)
+for prerequisites, authentication checks, expected run time, progress behaviour, and
+troubleshooting.
 
-```text
-                    AgentCompat CI
+### Sample result
 
-Baseline                    codex
-Candidate                   gemini
-Task                        add-pagination
+![Illustrative AgentCompat CI report layout for a Codex and Kiro run](docs/assets/sample-output.png)
 
-Build                       PASS
-Tests                       PASS
-Required paths              PASS
-Forbidden paths             FAIL
-Changed file limit          PASS
-
-Compatibility              87.5%
-
-Critical violation:
-
-Candidate modified:
-
-.github/workflows/ci.yml
-
-The engineering contract prohibits changes
-to CI configuration.
-
-Final verdict:
-
-FAIL
-```
-
-The candidate may have implemented the requested feature correctly while still violating the repository's engineering contract.
-
-AgentCompat makes that distinction visible.
+The report presents both agent runs, their repository changes, deterministic checks,
+compatibility percentage, critical failures, and the final verdict in one view. A
+blocking contract violation always changes the final verdict to `FAIL`, regardless
+of the aggregate compatibility percentage. Actual results depend on the agents and all
+files they generate. Git-ignored artifacts remain visible in a separate report section
+but do not consume the changed-file budget unless the contract opts in.
 
 ---
 
@@ -168,15 +158,49 @@ AgentCompat currently focuses on deterministic engineering signals.
 - Required files
 - Forbidden files
 - Maximum changed files
+- Separate visibility for Git-ignored artifacts
+- Optional changed-file exclusion globs
 - Unexpected file creation
 - Unexpected deletion
 
 ### Dependency Compatibility
 
-- Added dependencies
-- Removed dependencies
-- Forbidden dependencies
-- Dependency drift
+- Trusted direct dependency additions and removals
+- Forbidden direct dependencies
+- Context-aware version and hashed source drift
+- Exact lockfile additions, removals, and modifications
+- Required resolver-input/lockfile co-updates
+
+Python dependency observations currently support:
+
+- PEP 508, static PEP 621, and ordered PEP 735 dependency groups
+- validated Poetry and PDM declaration/source-policy subsets
+- bounded UTF-8 pip requirements and constraint files, including recursive `-r`
+  and `-c`, selected global index/link options, hashes, and supported editables
+- `pylock.toml`, `poetry.lock`, `pdm.lock`, `Pipfile.lock`, and version-gated `uv.lock`
+
+Known lock schema gates are pylock 1.0, Poetry 1.1/2.0/2.1, PDM 4.0.0 through
+4.5.1, Pipfile spec 6, and uv lock version 1 revisions 0 through 3. Newer schemas are
+rejected until their parsers are reviewed.
+
+The scanner separates direct declarations from constraint-only and transitive locked
+packages. It correlates version/source records by declaration scope, marker, and extras
+context, and hashes source locators before reporting them. Resolver inputs include
+declarations, constraints, dependency-group topology, integrity options, and repository
+source policy.
+
+The pip parser is deliberately fail-closed: unsupported pip-only forms or options cause
+the configured dependency observation to fail instead of being silently ignored.
+Poetry constraint strings receive deterministic syntax normalization, not full
+Poetry-core semantic equivalence. Lockfile parsers accept only their documented,
+version-gated subsets and configured lockfiles must exist.
+
+Lockfile co-update evidence proves only that every configured lockfile's exact bytes
+changed with a resolver input. It does not prove resolver freshness. AgentCompat does
+not fetch or verify artifact contents, build a complete resolution graph, or evaluate
+environment markers against concrete deployment targets. Appearance or disappearance
+of a package in a supported lockfile is treated as version/source drift when those
+strict rules are enabled.
 
 ### Policy Compatibility
 
@@ -206,6 +230,7 @@ baseline:
 
 candidates:
   - gemini
+  - kiro
 
 rules:
 
@@ -220,10 +245,29 @@ rules:
   required_paths:
     - "src/orders/**"
 
-  max_changed_files: 8
+  changed_files:
+    max: 8
+    include_ignored: false
+    exclude:
+      - ".pytest_cache/**"
+      - "**/__pycache__/**"
+      - "**/*.pyc"
+      - "**/*.egg-info/**"
 
   forbidden_dependencies:
     - requests
+
+  dependency_drift:
+    removals_forbidden: true
+    versions_must_not_change: true
+    sources_must_not_change: true
+    lockfiles_must_not_change: false
+    lockfiles_must_be_updated_for_dependency_changes: false
+    lockfiles: []
+
+  # Optional extra pip entrypoints and roles. Root requirements*.txt
+  # files remain requirement roots.
+  dependency_manifests: []
 
 tasks:
   - fixtures/tasks/add-pagination.yaml
@@ -251,7 +295,10 @@ prompt: |
 
 verification:
 
-  test_command: pytest -q
+  test_command: python -m pytest -q
+
+  build_command: >-
+    python -c "import ast, pathlib; [ast.parse(path.read_text(encoding='utf-8')) for path in pathlib.Path('src').rglob('*.py')]"
 
 rules:
 
@@ -261,8 +308,17 @@ rules:
   required_paths:
     - "src/orders/**"
 
-  max_changed_files: 6
+  changed_files:
+    max: 6
 ```
+
+Repository and task rules are merged without weakening the repository contract. When
+both define a maximum, the lower value is effective; in this example the task maximum
+is `6`, not the repository maximum of `8`. The legacy `max_changed_files` scalar is
+still accepted, but new contracts should use `changed_files.max`. A task may enable
+ignored-file counting, but cannot disable a repository requirement or add new exclusion
+patterns. It may only retain or remove literal exclusions already allowed by the
+repository contract.
 
 ---
 
@@ -273,7 +329,7 @@ AgentCompat CI currently targets Python 3.12+.
 Clone the repository:
 
 ```bash
-git clone https://github.com/YOUR_GITHUB_USERNAME/agentcompat-ci.git
+git clone https://github.com/varun-jose/agentcompat-ci.git
 cd agentcompat-ci
 ```
 
@@ -284,16 +340,11 @@ python3.12 -m venv .venv
 source .venv/bin/activate
 ```
 
-Install the project:
+Install the project and the development dependencies required by the example
+verification commands:
 
 ```bash
-pip install -e .
-```
-
-Install development dependencies if required:
-
-```bash
-pip install -e ".[dev]"
+python -m pip install -e ".[dev]"
 ```
 
 Verify:
@@ -301,6 +352,10 @@ Verify:
 ```bash
 agentcompat --version
 ```
+
+Keep the virtual environment activated while running AgentCompat. The fixture's
+verification commands invoke `python`, so calling `.venv/bin/agentcompat` without
+activating the environment does not reliably select the virtual environment's Python.
 
 ---
 
@@ -312,17 +367,33 @@ For the initial release, the target integrations are:
 
 - OpenAI Codex CLI
 - Google Gemini CLI
+- Amazon Kiro CLI
 
 Check availability:
 
 ```bash
 codex --version
 gemini --version
+kiro-cli --version
 ```
 
 Each CLI must be separately installed and authenticated according to its provider's instructions.
 
 AgentCompat does not store provider credentials.
+
+For a Codex-versus-Kiro run, check authentication before starting:
+
+```bash
+codex login status
+kiro-cli whoami
+```
+
+If either check reports that no session is configured, authenticate interactively:
+
+```bash
+codex login
+kiro-cli login
+```
 
 ---
 
@@ -334,14 +405,14 @@ Before running an experiment:
 agentcompat validate agent-contract.yaml
 ```
 
-Example:
+Abbreviated example:
 
 ```text
 AgentCompat Contract
 
 Project       sample-fastapi-api
 Baseline      codex
-Candidates    gemini
+Candidates    gemini, kiro
 Tasks         1
 
 Contract valid.
@@ -349,28 +420,96 @@ Contract valid.
 
 ---
 
-## Run a Compatibility Test
+## Run a Codex-versus-Kiro Compatibility Test
+
+Run this command from the repository root. It starts real Codex and Kiro sessions and
+may consume provider tokens or incur provider costs. The `fixtures/repos/orders-api`
+repository is currently a maintainer-local integration fixture and is not distributed
+in a fresh clone. Before using this exact example, confirm that it exists and contains
+at least one commit:
 
 ```bash
-agentcompat run \
-  --repo fixtures/repos/orders-api \
-  --baseline codex \
-  --candidate gemini \
-  --contract agent-contract.yaml \
-  --task fixtures/tasks/add-pagination.yaml
+test -d fixtures/repos/orders-api/.git
+git -C fixtures/repos/orders-api rev-parse --verify HEAD
 ```
 
-Optional JSON report:
+If it is absent, use a committed test repository together with a contract and task
+written for that repository; changing only `--repo` is not sufficient when the example
+rules and pagination task do not match the replacement project.
 
 ```bash
+source .venv/bin/activate
+
+PYTHONDONTWRITEBYTECODE=1 \
+PYTEST_ADDOPTS="-p no:cacheprovider" \
 agentcompat run \
   --repo fixtures/repos/orders-api \
   --baseline codex \
-  --candidate gemini \
+  --candidate kiro \
   --contract agent-contract.yaml \
   --task fixtures/tasks/add-pagination.yaml \
-  --json-output results.json
+  --json-output results-codex-vs-kiro-run-01.json
 ```
+
+`PYTHONDONTWRITEBYTECODE=1` and `PYTEST_ADDOPTS="-p no:cacheprovider"` reduce routine
+Python bytecode and pytest cache noise. They cannot guarantee that an agent will not
+create caches, editable-install metadata such as `*.egg-info`, or other artifacts.
+AgentCompat reports untracked Git-ignored paths separately as `ignored:` entries and as
+`diff.ignored_files` in JSON. They do not consume `changed_files.max` by default. Set
+`changed_files.include_ignored: true` to count them. `changed_files.exclude` globs
+remove matching paths only from that budget; excluded paths remain visible and still
+participate in forbidden-path checks. Ignored paths cannot satisfy required-path rules.
+
+The command arguments mean:
+
+- `--repo` selects the source Git repository. Only its committed `HEAD` is cloned;
+  uncommitted source-worktree changes are not included.
+- `--baseline codex` must match `baseline.agent` in the contract.
+- `--candidate kiro` must be listed under `candidates` in the contract.
+- `--task` must be one of the task paths declared by the contract.
+- `--json-output` writes the final structured report after both agents finish. It is
+  not a streaming log, and its parent directory must already exist. Use a fresh output
+  filename for each run because an older file remains unchanged while a new run is in
+  progress.
+
+The current CLI runs one baseline, one candidate, and one task per invocation. Codex
+runs first, followed by Kiro; they do not run concurrently. Each agent has a 900-second
+(15-minute) timeout. Each configured post-agent test or build command has a separate
+300-second (5-minute) timeout. With both agents and both verification commands, the
+configured worst-case timeout budget for this example is approximately 50 minutes.
+
+Agent stdout and stderr are captured in the structured result and optional JSON report
+rather than streamed live. The terminal report shows only bounded diagnostics for
+failed agent executions.
+An interactive terminal shows a stage spinner and elapsed time. When stdout is not an
+interactive terminal, progress output is disabled and the command can appear silent
+while an agent is working. Do not start a second run merely because no output appears.
+
+On macOS or Linux, inspect active processes from another terminal without interrupting
+the run:
+
+```bash
+pgrep -lf 'agentcompat|codex|kiro-cli'
+```
+
+The JSON report appears only when the complete run returns:
+
+```bash
+ls -lh results-codex-vs-kiro-run-01.json
+```
+
+Press `Ctrl+C` in the original terminal to cancel. The adapters attempt to terminate
+the active child process and the runner cleans up its disposable workspaces.
+
+This is a one-way contract-compliance experiment: Codex is the baseline and Kiro is
+the candidate. The current verdict applies deterministic contract checks to the Kiro
+workspace; it does not prove semantic equivalence between the two implementations.
+Baseline test and build outcomes are recorded, but the current verdict evaluates only
+baseline process execution; baseline verification failures are not separate blocking
+contract findings. Verification also runs after each agent in its writable workspace,
+so an agent can modify project tests before they execute.
+Agent-generated changes remain in disposable workspaces and are removed after the run;
+the source repository is not modified.
 
 ---
 
@@ -381,10 +520,12 @@ AgentCompat is designed for CI/CD use.
 | Code | Meaning |
 |---:|---|
 | `0` | Compatibility checks passed |
-| `1` | Behavioural compatibility failure |
+| `1` | Run completed, but one or more blocking contract checks failed |
 | `2` | Configuration or execution error |
 
-This makes AgentCompat suitable for release gates and automated pipelines.
+These codes and the JSON report can be consumed by shell-based CI experiments. Native
+GitHub Actions and pull-request reporting are roadmap items; the current command starts
+fresh agent runs rather than evaluating an existing pull-request diff.
 
 ---
 
@@ -530,6 +671,7 @@ FAIL
 |---|---|
 | OpenAI Codex CLI | Experimental |
 | Google Gemini CLI | Experimental |
+| Amazon Kiro CLI | Experimental |
 
 ### Planned
 
@@ -538,7 +680,6 @@ FAIL
 | GitHub Copilot CLI | Planned |
 | Claude Code | Planned |
 | Cursor | Planned |
-| Kiro | Planned |
 
 ---
 
@@ -552,6 +693,7 @@ FAIL
 - [x] Agent adapter architecture
 - [x] Codex integration
 - [x] Gemini integration
+- [x] Kiro integration
 - [x] Deterministic evaluators
 - [x] CLI compatibility report
 

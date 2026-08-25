@@ -22,4 +22,5 @@ rules:
   required_paths:
     - "src/orders/**"
 
-  max_changed_files: 6
+  changed_files:
+    max: 6
